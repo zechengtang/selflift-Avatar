@@ -97,6 +97,9 @@ This update adds four high-resolution memory-saving modes: `spatial`, `global_st
 
 ### Masks, fallback, and status
 
+- Spark-H3's native and KJ block patches are supported. With the `selflift_drop_k` entry supplied by a compatible Spark version, `drop_k` uses independent reblock planning followed by SelfLift's chunked norm/QKV producer and Spark BSA/reweight; SelfLift also chunks output projection, residual and MLP. `global_stream` uses 8-head groups by default, or the explicit KJ `minimax_head_chunks` split, and retains prepared block weights, input/output chunking and the outer weight-cache budget. QKV supports the same standard/TensorWise INT8 weights as Sol streaming. The full source hidden state remains live, but no full normalized hidden buffer or resident BF16 K is required. `global_ram` does not add CPU QKV staging for Spark. Older Spark versions, ordinary Spark and `keep_k` retain the callback compatibility path (full normalized hidden state, Spark-owned attention/head groups). All blocks must use Spark; additional top-level attention overrides such as TST are rejected. For dense low-resolution and sparse high-resolution stages, connect Spark only to `high_res_model`, set zero warmup and zero dense layers, and check `min_tokens`.
+
+- For spatial Spark, its `steps` limit must cover tile forwards: 3 high-resolution sampler steps with 4 tiles require at least 12 model evaluations. This does not change the sampler's step count or sigmas. Spark branches must not carry an additional top-level `optimized_attention_override`, including the dense hook installed by `ModelAttentionBackend`; configure that backend on the dense low-resolution branch only.
 - `spatial` still requires `video mask = 1` everywhere and `audio mask = 0` everywhere.
 - `global_stream`, `global`, and `global_ram` keep full-sequence masks, including partial/soft masks, without per-tile coordinate transforms.
 - If TST or another attention override is active, `global_stream`/`global_ram` fall back to full-sequence dense attention with chunked MLP. The override is preserved, but VRAM use is higher.
@@ -314,7 +317,7 @@ node tests/test_tiling_ui.mjs
 node tests/test_model_input_order.mjs
 ```
 
-The current suite contains 94 CPU tests covering AV packing, H3 audio scaling, full/partial masks, constant audio SolidMask conversion, native audio conditioning, two-stage sampling, automatic tile planning, tile stitching, complete-audio forwarding to every tile, invalid masked-tiling combinations, and the unmasked tiling path. The tests do not load a large H3 checkpoint or measure final video lip-sync quality.
+The suite includes AV packing, mask/sampling/tiling regressions, and Spark adapter tests. Set `COMFYUI_ROOT` when ComfyUI is outside the plugin's default parent directory. Set `SPARK_H3_ROOT` to a Spark-H3 checkout to test its real patch factories. Additionally set `H3_SPARK_SPLIT_LIBRARY` to the built producer library to run the CUDA integration test with a compatible chunked Spark comfy-kitchen build: both split schemes, uneven head groups, bootstrap and subsequent statistics reuse. These tests use synthetic tensors, not a large H3 checkpoint, and do not measure final video quality or workflow VRAM peaks.
 
 ## Acknowledgements
 

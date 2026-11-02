@@ -702,6 +702,302 @@ class GlobalWrapperTests(unittest.TestCase):
         torch.testing.assert_close(seen['audio_mask'], amask)
 
 
+class SparkCompatibilityTests(unittest.TestCase):
+    class Copy(torch.nn.Module):
+        def forward(self, x):
+            return x.clone()
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = torch.nn.Identity()
+            self.norm1 = SparkCompatibilityTests.Copy()
+            self.norm2 = SparkCompatibilityTests.Copy()
+            self.mlp = torch.nn.Identity()
+
+        def adaln_proj(self, _):
+            zero, one = torch.zeros(1), torch.ones(1)
+            return zero, one, one, zero, one, one
+
+    @staticmethod
+    def factory(block, layer, attention):
+        # Same closure contract as the released Spark factories. No Spark install
+        # required for the upstream test suite; real-factory tests below are opt-in.
+        namespace = {}
+        exec(compile(
+            'def _make_native_spark_block_patch(block, layer, attention):\n'
+            '    def block_patch(args, extra):\n'
+            '        assert block is not None and layer >= 0\n'
+            '        return extra["original_block"]({**args, "attention": attention})\n'
+            '    return block_patch\n', 'comfyui_nodes.py', 'exec'), namespace)
+        return namespace['_make_native_spark_block_patch'](block, layer, attention)
+
+    def setUp(self):
+        self.block = self.Block()
+        self.patcher = Patcher()
+        self.patcher.model.diffusion_model.blocks = torch.nn.ModuleList([self.block])
+        self.attention_calls = []
+
+        def attention(h, **kwargs):
+            self.attention_calls.append((h.shape, kwargs))
+            return h * 2
+
+        self.spark = self.factory(self.block, 0, attention)
+        self.options = {'patches_replace': {'dit': {('double_block', 0): self.spark}}}
+        self.patcher.model_options['transformer_options'] = self.options
+
+    def args(self, x):
+        return dict(img=x, t_emb=None, mod_segments=[(0, x.shape[0], 0)],
+                    rope_freqs=None, transformer_options={'minimax_head_chunks': 4})
+
+    def test_all_modes_preserve_spark_and_stream_flag(self):
+        from selflift_avatar_test import h3_stream_attention
+        for mode in ('global', 'global_ram', 'global_stream'):
+            with self.subTest(mode=mode), patch.object(h3_stream_attention, 'validate_projection',
+                    side_effect=AssertionError('Sol validation must not run for Spark')):
+                result = nodes._global_tiled_model(self.patcher, 128, mode, 2.)
+                wrapper = comfy.patcher_extension.get_all_wrappers(
+                    comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+                    result.model_options, is_model_options=True)[0]
+                self.assertEqual(wrapper.keywords['use_stream'], mode == 'global_stream')
+                self.assertEqual(wrapper.keywords['use_ram'], mode == 'global_ram')
+                self.assertEqual(result._selflift_global_attention, 'spark')
+                panel = nodes.format_plan(dict(kind='global', mode=mode, attention='spark'))
+                self.assertIn('Spark owns direct/chunked', panel)
+                self.assertNotIn('Host staging / 主机内存暂存: enabled', panel)
+
+    def test_forward_executes_spark_chunks_mlp_and_keeps_stream_scopes(self):
+        from selflift_avatar_test import h3_prepared_weights
+        from contextlib import contextmanager
+        active, seen = set(), []
+
+        @contextmanager
+        def scope(name):
+            active.add(name)
+            try:
+                yield
+            finally:
+                active.remove(name)
+
+        x = torch.randn(11, 8)
+        owner = self
+
+        class Executor:
+            class_obj = owner.patcher.model.diffusion_model
+            def __call__(self, streams, timestep, context, options, **kwargs):
+                owner.assertEqual(active, {'weights', 'output'})
+                fn = options['patches_replace']['dit'][('double_block', 0)]
+                return fn(owner.args(x.clone()), {'sentinel': True})['img']
+
+        hook = self.block.mlp.register_forward_pre_hook(lambda module, args: seen.append(args[0].shape[0]))
+        try:
+            with torch.inference_mode(), patch.object(h3_global_tiling, '_sparse_block',
+                    side_effect=AssertionError('Sol must not run')), \
+                    patch.object(h3_prepared_weights, 'weight_cache_budget', side_effect=lambda *a: scope('weights')), \
+                    patch.object(h3_output_chunking, 'output_chunking', side_effect=lambda *a: scope('output')):
+                result = h3_global_tiling._forward(Executor(), [x], None, None, self.options,
+                                                  chunk_size=4, use_stream=True)
+        finally:
+            hook.remove()
+        # norm modulation doubles h; attention doubles it again; MLP modulation
+        # doubles the residual: (x + 4*x) + 2*(x + 4*x) = 15*x.
+        torch.testing.assert_close(result, x * 15)
+        self.assertEqual(seen, [4, 4, 3])
+        self.assertEqual(len(self.attention_calls), 1)
+        self.assertEqual(self.attention_calls[0][0], x.shape)
+        self.assertEqual(self.attention_calls[0][1]['transformer_options']['minimax_head_chunks'], 4)
+        self.assertIs(self.options['patches_replace']['dit'][('double_block', 0)], self.spark)
+        self.assertEqual(active, set())
+
+    def test_reject_mismatched_partial_and_unknown_patches(self):
+        for replacement, message in (
+            (self.factory(self.Block(), 0, None), 'does not match'),
+            (self.factory(self.block, 1, None), 'does not match'),
+            (lambda *a: None, 'unsupported H3 block patch'),
+        ):
+            self.options['patches_replace']['dit'][('double_block', 0)] = replacement
+            with self.assertRaisesRegex(ValueError, message):
+                h3_global_tiling.tiled_model(self.patcher)
+        self.options['patches_replace']['dit'][('double_block', 0)] = self.spark
+        self.patcher.model.diffusion_model.blocks.append(self.Block())
+        with self.assertRaisesRegex(ValueError, 'every H3 block'):
+            h3_global_tiling.tiled_model(self.patcher)
+
+    def test_reject_external_override_instead_of_silently_dropping_it(self):
+        self.options['optimized_attention_override'] = lambda *a: None
+        with self.assertRaisesRegex(ValueError, 'external attention override'):
+            h3_global_tiling.tiled_model(self.patcher)
+
+    def test_native_sol_policy_and_dispatch_unchanged(self):
+        from comfy_extras import nodes_sparse_attention as native
+        policy = native.SparseAttnPatch(.9, .2, False, .8, .1, 4096, {2},
+                                        'exact_kv_and_rows', 0, False)
+        fn = native.make_h3_block_patch(self.block, 0, policy)
+        options = {'patches_replace': {'dit': {('double_block', 0): fn}},
+                   'optimized_attention_override': native.make_attention_override(policy, None)}
+        network = self.patcher.model.diffusion_model
+        self.assertEqual(h3_global_tiling._spark_specs(network, options), {})
+        specs = h3_global_tiling._sparse_specs(network, options)
+        self.assertIs(specs[0][0], policy)
+        x = torch.randn(11, 8)
+        with patch.object(h3_global_tiling, '_sparse_block', return_value=x) as sol:
+            result = h3_global_tiling._block_replace(self.block, 128, specs[0], 0,
+                                                     True, None, self.args(x), {})
+        self.assertIs(result['img'], x)
+        self.assertIs(sol.call_args.args[7], specs[0])
+        self.assertTrue(sol.call_args.args[10])
+
+    @unittest.skipUnless(os.environ.get('SPARK_H3_ROOT'), 'set SPARK_H3_ROOT for real Spark integration')
+    def test_real_spark_direct_chunked_kj_and_dense_dispatch(self):
+        sys.path.insert(0, os.environ['SPARK_H3_ROOT'])
+        try:
+            import comfyui_nodes as spark
+        finally:
+            sys.path.pop(0)
+        x = torch.randn(11, 8)
+        policy = SimpleNamespace(log_once=lambda *a: None)
+        activation = spark._ActivationLog()
+        for scheme in ('none', 'keep_k'):
+            with self.subTest(scheme=scheme):
+                state = SimpleNamespace(chunk_path=scheme)
+                fn = spark._make_native_spark_block_patch(self.block, 0, policy, state, activation, True, None)
+                self.options['patches_replace']['dit'][('double_block', 0)] = fn
+                self.assertIs(h3_global_tiling._spark_specs(self.patcher.model.diffusion_model, self.options)[0], fn)
+                with torch.inference_mode(), patch.object(spark, '_native_spark_eligible', return_value=(None, False)), \
+                        patch.object(spark, '_native_spark_attention', side_effect=lambda attn, h, *a: h * 2) as called:
+                    out = h3_global_tiling._spark_block_replace(self.block, fn, 4, self.args(x.clone()), {})['img']
+                torch.testing.assert_close(out, x * 15)
+                self.assertIs(called.call_args.args[5], state)
+                self.assertEqual(state.chunk_path, scheme)
+
+        class Attention(torch.nn.Module):
+            def forward(self, h, rope_freqs=None, transformer_options=None):
+                self.options = transformer_options
+                return h
+        self.block.attn = Attention()
+        kj = spark._make_kj_low_vram_spark_block_patch(self.block, 0, policy, None, activation, True, None)
+        override = lambda *a: None
+        with torch.inference_mode(), patch.object(spark, '_native_spark_eligible', return_value=(None, False)), \
+                patch.object(spark, '_make_kj_low_vram_attention_override', return_value=override):
+            out = h3_global_tiling._spark_block_replace(self.block, kj, 4, self.args(x.clone()), {})['img']
+        self.assertIs(self.block.attn.options['optimized_attention_override'], override)
+        torch.testing.assert_close(out, x * 9)
+        with torch.inference_mode(), patch.object(spark, '_native_spark_eligible', return_value=('warmup', False)), \
+                patch.object(spark, '_native_spark_attention', side_effect=AssertionError('dense must not call Spark')):
+            out = h3_global_tiling._spark_block_replace(self.block, fn, 4, self.args(x.clone()), {})['img']
+        torch.testing.assert_close(out, x * 9)
+
+
+    @unittest.skipUnless(os.environ.get('SPARK_H3_ROOT') and os.environ.get('H3_SPARK_SPLIT_LIBRARY'),
+                         'set SPARK_H3_ROOT and H3_SPARK_SPLIT_LIBRARY for CUDA integration')
+    def test_real_cuda_chunked_schemes_through_selflift(self):
+        self._cuda_feature_case()
+
+    @unittest.skipUnless(os.environ.get('SPARK_H3_ROOT') and os.environ.get('H3_SPARK_SPLIT_LIBRARY'),
+                         'CUDA integration is opt-in')
+    def test_real_cuda_drop_k_int8(self):
+        self._cuda_feature_case(quantized=True)
+
+    @unittest.skipUnless(os.environ.get('SPARK_H3_ROOT') and os.environ.get('H3_SPARK_SPLIT_LIBRARY'),
+                         'CUDA integration is opt-in')
+    def test_real_cuda_drop_k_default_stream_groups(self):
+        self._cuda_feature_case(head_chunks=None, direct_output=False)
+
+    def _cuda_feature_case(self, quantized=False, head_chunks=3, direct_output=True):
+        sys.path.insert(0, os.environ['SPARK_H3_ROOT'])
+        self.addCleanup(sys.path.remove, os.environ['SPARK_H3_ROOT'])
+        import comfyui_nodes as spark
+        from comfy.ops import mixed_precision_ops
+        from comfy.ldm.minimax.model import rope_rotation_table
+        from comfyui_backend import ComfyPackedLayout
+        from comfy_extras.nodes_sparse_attention import SparseAttnPatch
+        if not torch.cuda.is_available():
+            self.skipTest('CUDA required')
+        torch.manual_seed(43)
+        tokens, heads, video = 361, (16 if head_chunks is None else 4), 330
+        width = heads * 128
+        projection = mixed_precision_ops().Linear(width, 3 * width, bias=False, device='cuda')
+        projection.load_state_dict({'weight': torch.randn(3 * width, width, device='cuda', dtype=torch.bfloat16) * .02})
+        projection.requires_grad_(False)
+        if quantized:
+            from comfy_kitchen.tensor.base import QuantizedTensor
+            projection.weight = torch.nn.Parameter(QuantizedTensor.from_float(
+                projection.weight, 'TensorWiseINT8Layout', is_weight=True,
+                per_channel=True, convrot=True), requires_grad=False)
+        attn = torch.nn.Module()
+        attn.heads, attn.head_dim = heads, 128
+        attn.qkv_proj = projection
+        attn.q_norm = torch.nn.RMSNorm(128, eps=1e-5, device='cuda', dtype=torch.bfloat16)
+        attn.k_norm = torch.nn.RMSNorm(128, eps=1e-5, device='cuda', dtype=torch.bfloat16)
+        attn.out_proj = torch.nn.Identity()
+        self.block.attn = attn
+        self.block.mlp.fc1 = torch.nn.Identity()
+        self.block.mlp.fc2 = torch.nn.Identity()
+        modulation = tuple(torch.randn(3, width, device='cuda', dtype=torch.bfloat16) * .1
+                           for _ in range(6))
+        self.block.adaln_proj = lambda _: modulation
+        x = torch.randn(tokens, width, device='cuda', dtype=torch.bfloat16)
+        rope = rope_rotation_table(torch.randn(tokens, 128, device='cuda'), torch.bfloat16)
+        perm = torch.cat((torch.arange(31, tokens, device='cuda'), torch.arange(31, device='cuda')))
+        layout = ComfyPackedLayout(perm, perm.argsort(), (3, 10, 11), video, tokens,
+                                   torch.zeros(video, 3, device='cuda'), 31)
+        policy = SparseAttnPatch(1., .2, False, 1., 0., 0, set(), 'exact_kv_and_rows', 0, False)
+        states = [spark._RunState.create(3, 0., .2, producer_chunk=128,
+                  chunk_path=scheme, target_capability=tuple(torch.cuda.get_device_capability()))
+                  for scheme in ('drop_k', 'keep_k')]
+        for state in states:
+            state.spark_layout = lambda *a: layout
+            state.controller.direct_output = direct_output
+        patches = [spark._make_native_spark_block_patch(self.block, 0, policy, state,
+                   spark._ActivationLog(), True, None) for state in states]
+        self.options['patches_replace']['dit'][('double_block', 0)] = patches[0]
+        patched = h3_global_tiling.tiled_model(self.patcher, 128, use_stream=True)
+        self.assertEqual(patched._selflift_global_attention, 'spark_drop_k')
+        panel = nodes.format_plan(dict(kind='global', mode='global_stream', attention=patched._selflift_global_attention))
+        self.assertIn('Spark BSA/reweight', panel)
+        chunk_sizes = []
+        hook = attn.out_proj.register_forward_pre_hook(lambda module, args: chunk_sizes.append(args[0].shape[0]))
+        self.addCleanup(hook.remove)
+        with torch.inference_mode(), patch.object(h3_global_tiling, '_sparse_block',
+                side_effect=AssertionError('SelfLift Sol path must not run')):
+            for sigma in (.8, .6):
+                outputs = []
+                for fn in patches:
+                    args = self.args(x.clone())
+                    args['mod_segments'] = [(0, 31, 0),
+                        (31, tokens, torch.arange(video, device='cuda') % 2 + 1)]
+                    args['rope_freqs'] = rope
+                    args['transformer_options'] = dict(minimax_h3_layout=layout, sigmas=torch.tensor([sigma]))
+                    if head_chunks is not None:
+                        args['transformer_options']['minimax_head_chunks'] = head_chunks
+                    elif fn is patches[1]:
+                        # Reference matches SelfLift's default 8+8 head groups.
+                        args['transformer_options']['minimax_head_chunks'] = 2
+                    if fn is patches[0]:
+                        with patch.object(h3_global_tiling, '_native_attention_chunked_mlp',
+                                side_effect=AssertionError('drop_k must use the SelfLift producer')):
+                            outputs.append(h3_global_tiling._spark_block_replace(
+                                self.block, fn, 128, args, {}, use_stream=True)['img'])
+                    else:
+                        outputs.append(h3_global_tiling._spark_block_replace(self.block, fn, 128, args, {})['img'])
+                self.assertTrue(torch.isfinite(outputs[0]).all())
+                delta = (outputs[0].float() - outputs[1].float()).abs()
+                self.assertTrue(torch.equal(*outputs),
+                                f'max_abs={delta.max().item()} rmse={delta.square().mean().sqrt().item()}')
+        self.assertEqual(chunk_sizes, [128, 128, 105, tokens] * 2)
+        groups = 2 if head_chunks is None else head_chunks
+        for state in states:
+            counts = state.controller.counts
+            self.assertEqual(counts['split:bootstrap'], groups)
+            self.assertEqual(counts['split:steady'], groups)
+            if state.chunk_path == 'drop_k':
+                self.assertEqual(counts['selflift:drop_k_head_groups'], groups * 2)
+            else:
+                self.assertEqual(counts['split:kj_head_groups'], groups * 2)
+            self.assertEqual(counts['split:' + state.chunk_path], groups * 2)
+            self.assertEqual(counts['sparse:spark_comfy_native_chunked'], groups * 2)
+
+
 class GlobalChunkingTests(unittest.TestCase):
     class _Attn(torch.nn.Module):
         def __init__(self, dim, heads):

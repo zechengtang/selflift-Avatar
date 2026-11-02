@@ -97,6 +97,9 @@
 
 ### 遮罩、回退与状态
 
+- 支持 Spark-H3 原生及 KJ block 补丁。安装提供 `selflift_drop_k` 入口的 Spark 版本后，`drop_k` 先独立完成 reblock，再由 SelfLift 分块 norm/QKV producer 接入 Spark BSA/reweight，最后分块执行输出投影、residual 和 MLP。`global_stream` 默认每组 8 个 head；若显式设置 KJ 的 `minimax_head_chunks`，则沿用该分组而不重复拆分。同时保留 block 权重准备、输入输出分块和外层缓存预算。QKV 支持与 Sol streaming 相同的普通及 TensorWise INT8 权重。保留完整原始 hidden state，但不需要完整归一化 hidden buffer 或常驻 BF16 K。`global_ram` 暂不为 Spark 增加 CPU QKV 暂存。旧 Spark、普通 Spark 和 `keep_k` 保留原 callback 兼容路径（完整归一化 hidden state，Spark 自管 attention/head 分组）。要求所有 block 均使用 Spark，额外顶层 attention override（如 TST）会被拒绝。需要第一阶段 dense、第二阶段 sparse 时，仅将 Spark 接入 `high_res_model`，设置零 warmup、零 dense layers，并检查 `min_tokens`。
+
+- spatial 模式下，Spark 的 `steps` 上限必须覆盖 tile 前向次数：3 个高分辨率采样步、每步 4 个 tile 需要至少 12 次模型前向；采样器步数和 sigmas 不变。Spark 分支不能带额外顶层 `optimized_attention_override`，包括 `ModelAttentionBackend` 安装的 dense hook；该 backend 应仅配置到 dense 低分辨率分支。
 - `spatial` 仍要求 `video mask = 1` 全图、`audio mask = 0` 全音频。
 - `global_stream` / `global` / `global_ram` 保留完整全序列 mask，支持局部/软遮罩，不需要按 tile 做坐标变换。
 - 检测到 TST 或其他 attention override 时，`global_stream` / `global_ram` 会自动回退到“全序列 dense attention + 分块 MLP”，保留 override，但显存占用更高。

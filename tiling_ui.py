@@ -9,14 +9,23 @@ def format_plan(plan):
             "Full sequence / 全序列: 不切空间，保留完整 token/attention 上下文",
             f"Token chunk / token 分块: {plan.get('token_chunk', '?')}",
         ]
+        drop_k = plan.get("attention") == "spark_drop_k"
+        spark = drop_k or plan.get("attention") == "spark"
         if mode == "global_stream":
             cache = float(plan.get("weight_cache_gb", 0) or 0)
             lines.append(f"Weight cache / 权重缓存预算: {cache:.1f} GiB")
-            lines.append("Native sparse / 原生稀疏: required (SLA/sol-attn on every block)")
-        elif mode == "global_ram":
+            if not spark:
+                lines.append("Native sparse / 原生稀疏: required (SLA/sol-attn on every block)")
+        elif mode == "global_ram" and not spark:
             lines.append("Host staging / 主机内存暂存: enabled; slower, lower GPU workspace")
-        else:
+        elif not spark:
             lines.append("Compatible fallback / 兼容路径: global context; may use more VRAM than global_stream")
+        if drop_k:
+            lines.append("Attention / 注意力: independent Spark reblock → SelfLift QKV producer → Spark BSA/reweight")
+            lines.append("Memory / 显存: SelfLift token/head chunks; no full normalized hidden buffer; no CPU QKV staging")
+        elif spark:
+            lines.append("Attention / 注意力: Spark owns direct/chunked execution; SelfLift chunks norm/MLP")
+            lines.append("Memory / 显存: full hidden states retained; Sol-specific head streaming/RAM staging bypassed")
         if plan.get("fallback") == "attention_backend":
             lines.append("Fallback / 回退: dense attention backend override removed; using default full-sequence attention")
         elif plan.get("fallback"):

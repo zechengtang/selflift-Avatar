@@ -292,6 +292,9 @@ def progressive_sample(low_res_model, positive, negative, vae, latent_image, sam
                 "full_sequence": True,
             }
             fallback = getattr(high_model, "_selflift_global_fallback", None)
+            attention = getattr(high_model, "_selflift_global_attention", None)
+            if attention:
+                plan["attention"] = str(attention)
             if fallback:
                 plan["fallback"] = str(fallback)
             on_tiling_plan(plan)
