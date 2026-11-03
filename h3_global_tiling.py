@@ -23,6 +23,8 @@ import sys
 import weakref
 from contextlib import nullcontext
 
+from .h3_tiling import _is_spark_block_function, validate_spark_chunking
+
 import torch
 
 import comfy.model_base
@@ -147,15 +149,6 @@ def _has_unknown_attention_override(options):
     override = options.get("optimized_attention_override")
     return override is not None and not _is_native_sparse_function(
         override, "make_attention_override", "override")
-
-
-def _is_spark_block_function(fn):
-    """Recognize the released Spark-H3 factories, without importing the plugin."""
-    code = getattr(fn, "__code__", None)
-    return (code is not None and Path(code.co_filename).name == "comfyui_nodes.py"
-            and fn.__qualname__ in (
-                "_make_native_spark_block_patch.<locals>.block_patch",
-                "_make_kj_low_vram_spark_block_patch.<locals>.block_patch"))
 
 
 def _spark_specs(network, options):
@@ -520,6 +513,7 @@ def tiled_model(model, chunk_size=2048, use_ram=False, use_stream=False, weight_
         raise ValueError("selflift-Avatar global chunking requires ComfyUI's native H3 model with transformer blocks")
     options = model.model_options.get("transformer_options", {})
     spark_specs = _spark_specs(network, options)
+    validate_spark_chunking(model)
     unknown_override = _has_unknown_attention_override(options)
     specs = _sparse_specs(network, options, force_dense_on_unknown=True)
     if use_ram and use_stream:

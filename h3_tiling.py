@@ -4,6 +4,7 @@ from functools import partial
 import inspect
 import logging
 import math
+from pathlib import Path
 
 import torch
 
@@ -12,6 +13,32 @@ from comfy.ldm.minimax.model import PackedLayout
 import comfy.model_base
 import comfy.patcher_extension
 import comfy.sampler_helpers
+
+
+def _is_spark_block_function(fn):
+    """Recognize Spark-H3 block patches without importing the plugin."""
+    code = getattr(fn, "__code__", None)
+    return (code is not None and Path(code.co_filename).name == "comfyui_nodes.py"
+            and fn.__qualname__ in (
+                "_make_native_spark_block_patch.<locals>.block_patch",
+                "_make_kj_low_vram_spark_block_patch.<locals>.block_patch"))
+
+
+def validate_spark_chunking(model):
+    """Memory-saving wrappers require Spark's explicit drop_k integration."""
+    options = model.model_options.get("transformer_options", {})
+    for fn in options.get("patches_replace", {}).get("dit", {}).values():
+        if not _is_spark_block_function(fn):
+            continue
+        attention = inspect.getclosurevars(fn).nonlocals.get("attention")
+        if not callable(getattr(attention, "selflift_drop_k", None)):
+            raise ValueError(
+                "selflift-Avatar: highres_tiling requires Spark chunk_path=drop_k. "
+                "Set chunk_path to drop_k on the Spark node connected to the high-resolution "
+                "model, or disable highres_tiling to use chunk_path=none. "
+                "高分辨率省显存模式要求 Spark 的 chunk_path=drop_k；"
+                "请修改高分辨率分支的 Spark 节点，或关闭 highres_tiling 使用 none。"
+            )
 
 
 class SpatialContentState:
@@ -441,6 +468,7 @@ def tiled_model(model, latent_shapes, mode="auto", tiles=2, axis="auto", on_plan
         raise ValueError("SelfLift: high-resolution tiling requires H3 video and audio latent streams")
     if overlap is not None and (not isinstance(overlap, int) or overlap < 1):
         raise ValueError("SelfLift: tiling overlap must be a positive integer or None")
+    validate_spark_chunking(model)
     plan = {"mode": mode, "requested_tiles": tiles, "axis_choice": axis,
             "overlap": overlap, "content_state": content_state}
     patched = model.clone()

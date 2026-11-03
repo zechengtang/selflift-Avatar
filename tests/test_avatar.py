@@ -1,6 +1,7 @@
 """CPU tests: real ComfyUI packing/H3 scaling, synthetic denoiser (no weights)."""
 import copy
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -383,6 +384,35 @@ class PipelineTests(unittest.TestCase):
         low = Patcher()
         self.run_pipeline(None, low_res_model=low)
         self.assertEqual(self.stage_models, [low, low])
+    def spark_none_model(self):
+        model = Patcher()
+        block = SparkCompatibilityTests.Block()
+        model.model.diffusion_model.blocks = torch.nn.ModuleList([block])
+        fn = SparkCompatibilityTests.factory(block, 0, lambda h, **kwargs: h)
+        model.model_options['transformer_options'] = {
+            'patches_replace': {'dit': {('double_block', 0): fn}}}
+        return model
+    def test_spark_none_allowed_without_highres_tiling(self):
+        model = self.spark_none_model()
+        self.run_pipeline(None, low_res_model=model)
+        self.assertEqual(self.stage_models, [model, model])
+        self.assertEqual(self.stages, [2, 2])
+    def test_spark_none_tiling_rejected_before_low_sampling(self):
+        for mode in ('spatial', 'global', 'global_ram', 'global_stream'):
+            for separate_high_model in (False, True):
+                with self.subTest(mode=mode, separate=separate_high_model):
+                    model = self.spark_none_model()
+                    models = ({'high_res_model': model} if separate_high_model
+                              else {'low_res_model': model})
+                    with self.assertRaisesRegex(ValueError, 'chunk_path=drop_k'):
+                        self.run_pipeline(None, tiling=True, highres_tiling_mode=mode, **models)
+                    self.assertEqual(self.stage_models, [])
+    def test_spark_none_on_low_model_does_not_restrict_separate_high_model(self):
+        low, high = self.spark_none_model(), Patcher()
+        mask = NestedTensor([torch.ones_like(self.v), torch.zeros_like(self.a)])
+        self.run_pipeline(mask, tiling=True, low_res_model=low, high_res_model=high)
+        self.assertIs(self.stage_models[0].model, low.model)
+        self.assertIs(self.stage_models[1].model, high.model)
     def test_high_model_does_not_replace_low(self):
         high = Patcher()
         self.run_pipeline(None, high_res_model=high)
@@ -752,19 +782,28 @@ class SparkCompatibilityTests(unittest.TestCase):
 
     def test_all_modes_preserve_spark_and_stream_flag(self):
         from selflift_avatar_test import h3_stream_attention
+        attention = inspect.getclosurevars(self.spark).nonlocals['attention']
+        attention.selflift_drop_k = lambda *a: None
+        self.block.attn.qkv_proj = torch.nn.Identity()
         for mode in ('global', 'global_ram', 'global_stream'):
-            with self.subTest(mode=mode), patch.object(h3_stream_attention, 'validate_projection',
-                    side_effect=AssertionError('Sol validation must not run for Spark')):
+            with self.subTest(mode=mode), patch.object(h3_stream_attention, 'validate_projection') as validate:
                 result = nodes._global_tiled_model(self.patcher, 128, mode, 2.)
+                validate.assert_called_once_with(self.block.attn.qkv_proj)
                 wrapper = comfy.patcher_extension.get_all_wrappers(
                     comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                     result.model_options, is_model_options=True)[0]
                 self.assertEqual(wrapper.keywords['use_stream'], mode == 'global_stream')
                 self.assertEqual(wrapper.keywords['use_ram'], mode == 'global_ram')
-                self.assertEqual(result._selflift_global_attention, 'spark')
-                panel = nodes.format_plan(dict(kind='global', mode=mode, attention='spark'))
-                self.assertIn('Spark owns direct/chunked', panel)
+                self.assertEqual(result._selflift_global_attention, 'spark_drop_k')
+                panel = nodes.format_plan(dict(kind='global', mode=mode, attention='spark_drop_k'))
+                self.assertIn('Spark BSA/reweight', panel)
                 self.assertNotIn('Host staging / 主机内存暂存: enabled', panel)
+
+    def test_spatial_accepts_spark_drop_k(self):
+        attention = inspect.getclosurevars(self.spark).nonlocals['attention']
+        attention.selflift_drop_k = lambda *a: None
+        result = h3_tiling.tiled_model(self.patcher, [(1, 24, 3, 8, 8), (1, 32, 2, 12)])
+        self.assertIs(result.model, self.patcher.model)
 
     def test_forward_executes_spark_chunks_mlp_and_keeps_stream_scopes(self):
         from selflift_avatar_test import h3_prepared_weights
@@ -863,6 +902,8 @@ class SparkCompatibilityTests(unittest.TestCase):
                 fn = spark._make_native_spark_block_patch(self.block, 0, policy, state, activation, True, None)
                 self.options['patches_replace']['dit'][('double_block', 0)] = fn
                 self.assertIs(h3_global_tiling._spark_specs(self.patcher.model.diffusion_model, self.options)[0], fn)
+                with self.assertRaisesRegex(ValueError, 'chunk_path=drop_k'):
+                    h3_global_tiling.tiled_model(self.patcher)
                 with torch.inference_mode(), patch.object(spark, '_native_spark_eligible', return_value=(None, False)), \
                         patch.object(spark, '_native_spark_attention', side_effect=lambda attn, h, *a: h * 2) as called:
                     out = h3_global_tiling._spark_block_replace(self.block, fn, 4, self.args(x.clone()), {})['img']
@@ -876,6 +917,9 @@ class SparkCompatibilityTests(unittest.TestCase):
                 return h
         self.block.attn = Attention()
         kj = spark._make_kj_low_vram_spark_block_patch(self.block, 0, policy, None, activation, True, None)
+        self.options['patches_replace']['dit'][('double_block', 0)] = kj
+        with self.assertRaisesRegex(ValueError, 'chunk_path=drop_k'):
+            h3_global_tiling.tiled_model(self.patcher)
         override = lambda *a: None
         with torch.inference_mode(), patch.object(spark, '_native_spark_eligible', return_value=(None, False)), \
                 patch.object(spark, '_make_kj_low_vram_attention_override', return_value=override):
